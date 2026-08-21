@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+pinecone
+groq
+openai
+# sentence-transformers  # removed for serverless: use OpenAI embeddings instead
+pydantic
+python-dotenv
+pypdf

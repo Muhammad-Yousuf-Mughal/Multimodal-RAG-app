@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multimodal Multi-Vector RAG Architecture</title>
+    <style>
+        :root { --primary: #0070f3; --bg: #f4f6f8; --card: #ffffff; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); margin: 0; padding: 2rem; color: #333; }
+        .container { max-width: 900px; margin: 0 auto; }
+        .card { background: var(--card); border-radius: 10px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+        h1, h2, h3 { margin-top: 0; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+        label { display: block; font-weight: 600; margin-bottom: 0.5rem; font-size: 0.9rem; }
+        input[type="text"], input[type="file"], input[type="number"] { width: 100%; padding: 0.6rem; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }
+        button { background: var(--primary); color: white; border: none; padding: 0.7rem 1.2rem; border-radius: 6px; cursor: pointer; font-weight: 600; transition: opacity 0.2s; }
+        button:hover { opacity: 0.9; }
+        .chat-box { background: #fafafa; border: 1px solid #eaeaea; border-radius: 8px; padding: 1rem; min-height: 200px; max-height: 400px; overflow-y: auto; }
+        .msg { margin-bottom: 1rem; padding: 0.8rem; border-radius: 6px; }
+        .msg.user { background: #e6f0ff; border-left: 4px solid var(--primary); }
+        .msg.ai { background: #ffffff; border: 1px solid #e1e1e1; }
+        .source-tag { display: inline-block; background: #eef9f2; color: #1e7e34; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.8rem; margin-top: 0.4rem; margin-right: 0.4rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Multimodal RAG (Pinecone + Groq + GPT-4o mini)</h1>
+
+        <!-- Settings & Ingestion -->
+        <div class="card">
+            <h2>1. Document Ingestion Pipeline</h2>
+            <div class="grid">
+                <div>
+                    <label>Upload PDF Document (up to 20MB)</label>
+                    <input type="file" id="pdfFile" accept="application/pdf">
+                </div>
+                <div>
+                    <label>Chunk Size (Characters)</label>
+                    <input type="number" id="chunkSize" value="500" min="200" step="50">
+                </div>
+            </div>
+            <br>
+            <button onclick="processPDF()">Partition & Index PDF</button>
+            <p id="uploadStatus" style="font-weight: 600; color: var(--primary);"></p>
+        </div>
+
+        <!-- Query & Retrieval -->
+        <div class="card">
+            <h2>2. Semantic Querying & Retrieval Controls</h2>
+            <div class="grid" style="margin-bottom: 1rem;">
+                <div>
+                    <label>Top-K Retrieval</label>
+                    <input type="number" id="topK" value="5" min="1">
+                </div>
+                <div>
+                    <label>Similarity Threshold (0.0 to 1.0)</label>
+                    <input type="number" id="threshold" value="0.05" step="0.01" min="0" max="1">
+                </div>
+            </div>
+            
+            <label>Ask a Question</label>
+            <div style="display: flex; gap: 0.5rem;">
+                <input type="text" id="userQuery" placeholder="What does the diagram on page 3 illustrate?">
+                <button onclick="sendQuery()">Submit</button>
+            </div>
+
+            <h3>Conversation History</h3>
+            <div id="chatHistory" class="chat-box"></div>
+        </div>
+    </div>
+
+    <script>
+        async function processPDF() {
+            const fileInput = document.getElementById('pdfFile');
+            const chunkSize = document.getElementById('chunkSize').value;
+            const status = document.getElementById('uploadStatus');
+
+            if (!fileInput.files[0]) return alert("Please select a PDF file first.");
+
+            const formData = new FormData();
+            formData.append("file", fileInput.files[0]);
+            formData.append("chunk_size", chunkSize);
+
+            status.innerText = "Partitioning PDF with Unstructured, summarizing text with Groq, processing images with GPT-4o mini, and indexing to Pinecone...";
+
+            try {
+                const res = await fetch('/api/upload', { method: 'POST', body: formData });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    throw new Error(data.detail || `Upload failed with HTTP ${res.status}.`);
+                }
+                status.innerText = data.message || "Document processed successfully.";
+            } catch (err) {
+                status.innerText = `Error processing document: ${err.message}`;
+                status.style.color = "#c62828";
+            }
+        }
+
+        async function sendQuery() {
+            const queryInput = document.getElementById('userQuery');
+            const chatHistory = document.getElementById('chatHistory');
+            const topK = document.getElementById('topK').value;
+            const threshold = document.getElementById('threshold').value;
+            const query = queryInput.value.trim();
+
+            if (!query) return;
+
+            // Render User Message
+            chatHistory.innerHTML += `<div class="msg user"><strong>You:</strong> ${query}</div>`;
+            queryInput.value = '';
+
+            const formData = new FormData();
+            formData.append("query", query);
+            formData.append("top_k", topK);
+            formData.append("threshold", threshold);
+
+            try {
+                const res = await fetch('/api/query', { method: 'POST', body: formData });
+                const data = await res.json().catch(() => ({}));
+
+                const answerText = data.answer || data.response || data.result || 'The answer is not available in the provided document.';
+                let sourcesHtml = '';
+                if (data.sources && data.sources.length > 0) {
+                    sourcesHtml = '<br><strong>Source Attribution:</strong><br>' + data.sources.map(s => 
+                        `<span class="source-tag">Doc: ${s.document} | Page ${s.page} | Type: ${s.type} | Score: ${s.similarity_score}</span>`
+                    ).join('');
+                }
+
+                chatHistory.innerHTML += `<div class="msg ai"><strong>AI:</strong> ${answerText}<br>${sourcesHtml}</div>`;
+                chatHistory.scrollTop = chatHistory.scrollHeight;
+
+            } catch (err) {
+                chatHistory.innerHTML += `<div class="msg ai" style="color:red;">Error fetching response.</div>`;
+            }
+        }
+    </script>
+</body>
+</html>
