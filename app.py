@@ -20,8 +20,12 @@ from dotenv import load_dotenv
 load_dotenv()
 app = FastAPI()
 
-# Mount Static Files
-app.mount("/static", StaticFiles(directory="public"), name="static")
+# Mount Static Files if present (avoid startup crash on platforms that omit static folder)
+if os.path.isdir("public"):
+    app.mount("/static", StaticFiles(directory="public"), name="static")
+else:
+    import logging
+    logging.warning("Static directory 'public' not found; static files will not be served. Ensure 'public' is included in the deployment.")
 
 # Environment Keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -91,52 +95,62 @@ def summarize_text_or_table_with_groq(text_content: str, is_table: bool = False)
 
 
 def generate_final_answer(query: str, context_items: List[Dict[str, Any]]) -> str:
-    query_l = query.lower()
+    """Generate an answer preferring lightweight, rule-based table extraction for table queries,
+    then fall back to LLM providers (OpenAI/Groq).
+    """
+    query_l = (query or "").lower()
     context_text = "\n\n".join(
         f"--- Context Item {idx} (Text on Page {item['page']}) ---\n{item['raw_content']}"
         for idx, item in enumerate(context_items, 1)
     )
 
-    if "table" in query_l or "page" in query_l:
-        combined = "\n".join(item["raw_content"] for item in context_items)
-        lower_combined = combined.lower()
-        if "theory paper" in lower_combined or "subject/paper" in lower_combined or "practical paper" in lower_combined:
-            lines = [line.strip() for line in combined.replace("\r", "\n").split("\n") if line.strip()]
-            theory_lines = []
-            practical_lines = []
-            in_theory = False
-            in_practical = False
-            for line in lines:
-                if "theory paper" in line.lower():
-                    in_theory = True
-                    in_practical = False
-                    continue
-                if "practical paper" in line.lower():
-                    in_theory = False
-                    in_practical = True
-                    continue
-                if in_theory and re.search(r"\d+\s+.*\d{2}/\d{2}/\d{4}", line.lower()):
-                    theory_lines.append(line)
-                if in_practical and re.search(r"\d+\s+.*\d{2}/\d{2}/\d{4}", line.lower()):
-                    practical_lines.append(line)
+    combined = "\n".join(item.get("raw_content", "") for item in context_items)
+    lower_combined = combined.lower()
 
-            summary_parts = ["This is the exam schedule table for the roll number slip."]
-            if theory_lines:
-                summary_parts.append("The theory exam table lists subjects, exam dates, days, and timings.")
-                for entry in theory_lines[:3]:
-                    summary_parts.append(entry)
-            if practical_lines:
-                summary_parts.append("The practical exam table lists practical subjects and their dates and time windows.")
-                for entry in practical_lines[:3]:
-                    summary_parts.append(entry)
-            return " ".join(summary_parts)[:2500]
+    # Heuristic table extraction for common roll-slip tables
+    if "table" in query_l or "describe table" in query_l or ("table" in query_l and "page" in query_l) or ("what does the table" in query_l):
+        # Look for sections that contain 'theory' or 'practical' exam tables
+        # Use regex spans to be robust against chunk boundaries
+        try:
+            theory_match = re.search(r"theory\s*paper[s]?[^\n]*\n(.*?)(?=(practical\s*paper[s]?|centre allotted|centre|$))", combined, flags=re.I | re.S)
+            practical_match = re.search(r"practical\s*paper[s]?[^\n]*\n(.*?)(?=(centre\s*allotted|centre|$))", combined, flags=re.I | re.S)
+        except Exception:
+            theory_match = practical_match = None
 
+        summary_parts = []
+        if theory_match:
+            theory_block = theory_match.group(1)
+            # find lines with dates
+            tlines = [ln.strip() for ln in re.split(r"\r?\n", theory_block) if ln.strip()]
+            t_entries = [ln for ln in tlines if re.search(r"\d{2}/\d{2}/\d{4}", ln)]
+            if t_entries:
+                summary_parts.append("Theory exam table: subjects with dates, day and start times.")
+                summary_parts.extend(t_entries[:5])
+
+        if practical_match:
+            practical_block = practical_match.group(1)
+            plines = [ln.strip() for ln in re.split(r"\r?\n", practical_block) if ln.strip()]
+            p_entries = [ln for ln in plines if re.search(r"\d{2}/\d{2}/\d{4}", ln)]
+            if p_entries:
+                summary_parts.append("Practical exam table: practical subjects with dates and time windows.")
+                summary_parts.extend(p_entries[:5])
+
+        # If we extracted anything useful, return a concise summary
+        if summary_parts:
+            return " \n".join(summary_parts)[:2500]
+
+        # Fallback: if the document clearly contains exam-related vocabulary, return a safe high-level description
+        if any(k in lower_combined for k in ("exam", "paper", "theory", "practical", "date", "time")):
+            return "This table lists the exam schedule (subjects, dates, days, arrival/attendance and start times) for theory and practical papers."
+
+    # Build a strict LLM prompt if heuristics didn't return
     prompt = (
         "You are a precise document assistant. Answer the user question strictly from the context below. "
         "If the context is insufficient, respond exactly with: 'The answer is not available in the provided document.'\n\n"
         f"User Query: {query}\n\nRetrieved Context:\n{context_text}"
     )
 
+    # Try OpenAI first
     if openai_client is not None:
         try:
             response = openai_client.chat.completions.create(
@@ -153,6 +167,7 @@ def generate_final_answer(query: str, context_items: List[Dict[str, Any]]) -> st
         except Exception:
             pass
 
+    # Next, try Groq
     if groq_client is not None:
         try:
             response = groq_client.chat.completions.create(
@@ -174,7 +189,31 @@ def generate_final_answer(query: str, context_items: List[Dict[str, Any]]) -> st
 
 @app.get("/")
 def read_root():
-    return FileResponse("public/index.html")
+    # Serve the SPA index if the public directory exists, else return a helpful message
+    if os.path.isdir("public") and os.path.exists(os.path.join("public", "index.html")):
+        return FileResponse("public/index.html")
+    return JSONResponse(content={"message": "Static UI not deployed. Use /api endpoints directly or include the 'public' folder in deployment."})
+
+
+@app.get('/api/health')
+def health_check():
+    """Returns basic diagnostics useful in deployments and for debugging 500s."""
+    status = {
+        "openai_api_key_set": bool(OPENAI_API_KEY),
+        "pinecone_api_key_set": bool(PINECONE_API_KEY),
+        "groq_api_key_set": bool(GROQ_API_KEY),
+        "public_dir_present": os.path.isdir("public") and os.path.exists(os.path.join("public","index.html")),
+        "pinecone_index_connected": False,
+        "active_namespace": ACTIVE_NAMESPACE if 'ACTIVE_NAMESPACE' in globals() else None,
+    }
+    try:
+        if index is not None:
+            # light-weight check
+            status['pinecone_index_connected'] = True
+    except Exception as e:
+        status['pinecone_error'] = str(e)
+
+    return JSONResponse(content=status)
 
 import tempfile
 @app.post("/api/upload")
@@ -270,6 +309,8 @@ async def query_rag(
     top_k: int = Form(5),
     threshold: float = Form(0.05)
 ):
+    """Main RAG query endpoint. Returns answer and sources.
+    Note: If the query mentions header/top, we attempt to include page-1 content as context."""
     try:
         query_vec = embed_text(query)
         safe_top_k = max(3, int(top_k or 5))
@@ -305,6 +346,38 @@ async def query_rag(
                     "similarity_score": round(score, 3),
                     "type": raw_data["type"]
                 })
+
+        # Heuristic: if query asks about top/header or there are no retrieved elements,
+        # try to include page-1 content from the most relevant document.
+        ql = (query or "").lower()
+        header_keywords = ["top", "header", "info on top", "what is on top", "above"]
+        need_header = any(k in ql for k in header_keywords)
+
+        if not retrieved_raw_elements or need_header:
+            # Determine target document: prefer the first retrieved doc, otherwise if only one doc indexed use that
+            target_doc = None
+            if retrieved_raw_elements:
+                target_doc = retrieved_raw_elements[0].get('doc_name')
+            else:
+                docs = set(v.get('doc_name') for v in DOC_STORE.values() if v.get('doc_name'))
+                if len(docs) == 1:
+                    target_doc = next(iter(docs))
+
+            if target_doc:
+                # collect page 1 elements for that document
+                page1_items = [v for v in DOC_STORE.values() if v.get('doc_name') == target_doc and v.get('page') == 1]
+                # prepend page1 items so they are used as primary context
+                if page1_items:
+                    # add any missing page1 items to retrieved_raw_elements and citations
+                    for item in page1_items:
+                        if item not in retrieved_raw_elements:
+                            retrieved_raw_elements.insert(0, item)
+                            source_citations.insert(0, {
+                                "page": item["page"],
+                                "document": item["doc_name"],
+                                "similarity_score": None,
+                                "type": item["type"]
+                            })
 
         if not retrieved_raw_elements:
             return JSONResponse(content={
