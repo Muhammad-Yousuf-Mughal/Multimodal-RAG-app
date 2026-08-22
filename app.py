@@ -47,16 +47,39 @@ except Exception:
 
 
 def embed_text(text: str):
-    """Return embedding vector for text using OpenAI embeddings if available, else local embedder."""
+    """Return embedding vector for text using OpenAI embeddings if available, else local embedder.
+
+    Improved behavior:
+    - Retries OpenAI embedding calls with exponential backoff on transient errors (e.g., 429 rate limits).
+    - Logs the underlying exception and surfaces a diagnostic message if all retries fail, rather than the generic provider-missing error.
+    """
+    last_exc = None
     if openai_client is not None:
-        try:
-            resp = openai_client.embeddings.create(model="text-embedding-3-small", input=text)
-            # SDK returns resp.data[0].embedding
-            return resp.data[0].embedding
-        except Exception:
-            pass
+        # Retry transient failures (rate limits/network) with exponential backoff
+        import time, logging
+        max_attempts = 5
+        base_backoff = 0.5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = openai_client.embeddings.create(model="text-embedding-3-small", input=text)
+                return resp.data[0].embedding
+            except Exception as e:
+                last_exc = e
+                # If this was the last attempt, break and fall back / error
+                if attempt == max_attempts:
+                    logging.exception("OpenAI embeddings failed after %s attempts", max_attempts)
+                    break
+                # Backoff and retry
+                sleep_time = base_backoff * (2 ** (attempt - 1))
+                logging.info("OpenAI embeddings attempt %s failed; retrying in %.2fs: %s", attempt, sleep_time, str(e))
+                time.sleep(sleep_time)
+    # Local fallback (developer can install sentence-transformers for on-instance embeddings)
     if _local_embedder is not None:
         return _local_embedder.encode(text).tolist()
+    # If we had an OpenAI client but it failed, surface the last error for diagnostics (non-secret)
+    if last_exc is not None:
+        raise RuntimeError(f"Embedding failed after retries: {last_exc}")
+    # No provider at all
     raise RuntimeError("No embedding provider available. Set OPENAI_API_KEY or install sentence-transformers locally.")
 
 # Pinecone Setup
